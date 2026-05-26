@@ -1,27 +1,22 @@
 """
-Jobright.ai Job Scraper - Modal Login Flow
-==========================================
-The correct flow:
-  1. Open jobright.ai homepage
-  2. Open the auth modal from the homepage
-  3. Switch from signup to sign-in if needed
-  4. Fill email + password in the modal
-  5. Submit → redirects to /jobs/recommend
-  6. Open the first recommended job and scrape its detail page
-
-SETUP:
-  pip install "scrapling[fetchers]" python-dotenv
-  scrapling install
-
-  # Create .env file with your credentials:
-  JOBRIGHT_EMAIL=your@email.com
-  JOBRIGHT_PASSWORD=yourpassword
+Jobright.ai Job Scraper - Batch Flow (20 jobs, single browser session)
+======================================================================
+Flow:
+  1. Login via auth modal on homepage (StealthyFetcher)
+  2. Navigate to /jobs/recommend
+  3. Collect N job links via /swan/recommend/list/jobs API
+  4. For each job link (same browser session):
+     a. page.goto(job_detail_url)
+     b. Wait for script#jobright-helper-job-detail-info
+     c. Parse full JD payload
+     d. POST to Hermes dashboard ingest endpoint
+  5. Save batch results JSON + print summary
 
 RUN:
-  python Test.py            # local machine
-  xvfb-run python Test.py   # linux server
-  python Test.py --xvfb     # auto-start Xvfb
-  python Test.py --debug    # save debug HTML
+  python Test.py --xvfb                  # scrape 1 job (default)
+  python Test.py --xvfb --jobs 20       # scrape 20 jobs
+  python Test.py --xvfb --jobs 20 --debug
+  python Test.py --xvfb --jobs 3 --wait 8000
 """
 
 import argparse
@@ -29,30 +24,37 @@ import html
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-EMAIL    = os.getenv("JOBRIGHT_EMAIL", "").strip()
-PASSWORD = os.getenv("JOBRIGHT_PASSWORD", "").strip()
+EMAIL                 = os.getenv("JOBRIGHT_EMAIL", "").strip()
+PASSWORD              = os.getenv("JOBRIGHT_PASSWORD", "").strip()
+SCRAPER_INGEST_SECRET = os.getenv("SCRAPER_INGEST_SECRET", "").strip()
+INGEST_URL            = "https://hermes-dashboard-nine.vercel.app/api/job-descriptions"
 
 
-# ─── CLI Args ─────────────────────────────────────────────────────────────────
+# --- CLI Args ------------------------------------------------------------------
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--xvfb",   action="store_true", help="Auto-start Xvfb virtual display")
-parser.add_argument("--jobs",   type=int, default=1,                  help="Reserved for future multi-job support")
-parser.add_argument("--wait",   type=int, default=6000,               help="Wait ms for jobs page to render")
-parser.add_argument("--output", default="jobright_first_job.json",    help="Output file")
-parser.add_argument("--debug",  action="store_true",                  help="Save debug HTML files")
+parser = argparse.ArgumentParser(description="Jobright.ai batch job scraper")
+parser.add_argument("--xvfb",         action="store_true", help="Auto-start Xvfb virtual display")
+parser.add_argument("--jobs",         type=int, default=1, help="Number of jobs to scrape (default: 1)")
+parser.add_argument("--wait",         type=int, default=6000, help="Wait ms for pages to render (default: 6000)")
+parser.add_argument("--output",       default="jobright_batch.json", help="Batch output JSON file")
+parser.add_argument("--debug",        action="store_true", help="Save debug HTML files on failure")
+parser.add_argument("--dry-run",      action="store_true", help="Collect links only, don't scrape details")
 args = parser.parse_args()
 
 
-# ─── Xvfb ─────────────────────────────────────────────────────────────────────
+# --- Xvfb ----------------------------------------------------------------------
 
 xvfb_proc = None
 
@@ -75,156 +77,44 @@ def start_xvfb(display=":99", res="1920x1080x24"):
 def stop_xvfb():
     if xvfb_proc:
         xvfb_proc.terminate()
+        try:
+            xvfb_proc.wait(timeout=5)
+        except Exception:
+            xvfb_proc.kill()
         print("🖥️  Xvfb stopped.")
 
 
-# ─── Playwright Page Actions ──────────────────────────────────────────────────
+# --- Helpers -------------------------------------------------------------------
 
-def do_homepage_login(page):
-    """
-    Full login flow inside the Playwright browser:
-      1. Wait for homepage to load
-      2. Open the auth dialog from the homepage
-      3. Switch from signup to sign-in when the site opens signup first
-      4. Fill email + password in the sign-in modal
-      5. Wait for redirect to dashboard / jobs page
-    """
-    print("   ⏳ Waiting for homepage to fully load...")
-    page.wait_for_load_state("networkidle", timeout=20000)
-    page.wait_for_timeout(800)
-
-    # ── Step A: Open auth modal ────────────────────────────────────
-    print("   🖱️  Opening auth dialog...")
-    auth_trigger_selectors = [
-        "text=SIGN IN",
-        "text=Sign In",
-        "text=Sign in",
-        "button:has-text('JOIN NOW')",
-        "button:has-text('Try For Free')",
+def dismiss_modals(page):
+    """Close any popups or modals that appear."""
+    selectors = [
+        "button:has-text(\"EXIT\")",
+        "button:has-text(\"Close\")",
+        "button:has-text(\"Not now\")",
     ]
-
-    auth_trigger = None
-    for sel in auth_trigger_selectors:
-        auth_trigger = page.query_selector(sel)
-        if auth_trigger:
-            print(f"   ✅ Found auth trigger: {sel}")
-            auth_trigger.click()
-            page.wait_for_timeout(700)
-            break
-
-    if not auth_trigger:
-        print("   ⚠️  No auth trigger found on homepage.")
-        if args.debug:
-            page.screenshot(path="debug_no_auth_trigger.png")
-        return
-
-    # Some homepage buttons open signup first. Switch to the login form explicitly.
-    switch_to_signin = (
-        page.query_selector("button:has-text('Already a member? Sign in now')")
-        or page.query_selector("button:has-text('Sign in now')")
-        or page.query_selector("button:has-text('Already a member')")
-        or page.query_selector("button:has-text('Not a member? Sign up now')")
-    )
-    if switch_to_signin and "not a member" not in (switch_to_signin.inner_text() or "").strip().lower():
-        print("   🔁 Auth dialog opened in signup mode — switching to sign in...")
-        switch_to_signin.click()
-        page.wait_for_timeout(700)
-
-    # ── Step B: Fill login modal / form ───────────────────────────
-    print("   🔐 Looking for sign-in fields in modal...")
-    email_selector = "input[placeholder='Email'], input[placeholder*='email' i], input[type='email'], input[name='email']"
-    password_selector = "input[placeholder='Password'], input[type='password']"
-
-    try:
-        page.wait_for_selector(email_selector, timeout=10000)
-        page.wait_for_selector(password_selector, timeout=10000)
-    except Exception:
-        print("   ⚠️  Sign-in fields did not appear. Saving screenshot...")
-        if args.debug:
-            page.screenshot(path="debug_signin_fields.png")
-        return
-
-    email_input = page.query_selector(email_selector)
-    password_input = page.query_selector(password_selector)
-
-    if not email_input or not password_input:
-        print("   ❌ Could not find both sign-in inputs.")
-        return
-
-    email_input.click()
-    email_input.fill("")
-    email_input.fill(EMAIL)
-    print(f"   ✅ Email entered: {EMAIL}")
-
-    page.wait_for_timeout(100)
-
-    password_input.click()
-    password_input.fill("")
-    password_input.fill(PASSWORD)
-    print("   ✅ Password entered.")
-
-    page.wait_for_timeout(150)
-
-    # ── Step C: Submit ─────────────────────────────────────────────
-    print("   🚀 Submitting login form...")
-    submit_btn = (
-        page.query_selector("button[type='submit']:has-text('SIGN IN')")
-        or page.query_selector("button[type='submit']:has-text('Sign In')")
-        or page.query_selector("button:has-text('SIGN IN')")
-        or page.query_selector("button:has-text('Sign In')")
-        or page.query_selector("button:has-text('Sign in')")
-    )
-
-    if submit_btn:
-        submit_btn.click()
-    else:
-        password_input.press("Enter")
-
-    # ── Step E: Wait for post-login navigation ─────────────────────
-    print("   ⏳ Waiting for redirect after login...")
-    try:
-        page.wait_for_url("**/jobs/recommend**", timeout=20000)
-        print("   ✅ Redirected to jobs page!")
-    except Exception:
-        # May redirect to dashboard or home instead of directly to /jobs
-        page.wait_for_load_state("networkidle", timeout=15000)
-        page.wait_for_timeout(1200)
-        print(f"   Current URL after login: {page.url}")
-
-    if args.debug:
-        page.screenshot(path="debug_after_login.png")
-        print("   📸 Screenshot saved: debug_after_login.png")
+    for sel in selectors:
+        try:
+            btn = page.query_selector(sel)
+            if btn:
+                btn.click()
+                page.wait_for_timeout(400)
+        except Exception:
+            pass
 
 
 def scroll_and_wait(page):
-    """Scroll down progressively to trigger lazy-loaded job cards."""
-    page.wait_for_timeout(500)
-    for y in [500, 1100, 1800]:
+    """Progressively scroll to trigger lazy-loaded content."""
+    page.wait_for_timeout(400)
+    for y in [400, 900, 1500, 2200, 3000]:
         page.evaluate(f"window.scrollTo(0, {y})")
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(300)
     page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_timeout(250)
-
-
-def dismiss_detail_modals(page):
-    """Close popups that can block clicks on the job detail page."""
-    modal_buttons = [
-        "button:has-text('EXIT')",
-        "button:has-text('Close')",
-        "button:has-text('Not now')",
-    ]
-    for sel in modal_buttons:
-        btn = page.query_selector(sel)
-        if btn:
-            try:
-                btn.click()
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
+    page.wait_for_timeout(300)
 
 
 def get_html_content(target):
-    """Return HTML from either a Playwright page or a Scrapling response."""
+    """Extract HTML string from a Playwright page or Scrapling response."""
     html_content = getattr(target, "html_content", None)
     if isinstance(html_content, str) and html_content:
         return html_content
@@ -241,116 +131,7 @@ def get_html_content(target):
     if isinstance(html_attr, str) and html_attr:
         return html_attr
 
-    raise AttributeError(f"Could not extract HTML content from {type(target).__name__}")
-
-
-def open_first_job_from_recommendations(page):
-    """Open the first visible recommended job while staying in the same session."""
-    print("   📄 Opening the first recommended job...")
-    page.wait_for_url("**/jobs/recommend**", timeout=20000)
-    page.wait_for_load_state("networkidle", timeout=20000)
-    page.wait_for_timeout(max(args.wait, 2500))
-    dismiss_detail_modals(page)
-    scroll_and_wait(page)
-
-    first_href = None
-
-    for attempt in range(2):
-        first_href = page.evaluate(
-            """() => {
-                const seen = new Set();
-                const links = Array.from(document.querySelectorAll("a[href*='/jobs/info/']"));
-                for (const link of links) {
-                    const href = link.getAttribute("href") || "";
-                    if (!href || seen.has(href)) continue;
-                    seen.add(href);
-                    const text = (link.innerText || link.textContent || "").trim();
-                    if (text.length > 30) return link.href;
-                }
-                return links[0]?.href || null;
-            }"""
-        )
-        if first_href:
-            break
-
-        print(f"   ⏳ Job links not ready yet (attempt {attempt + 1}/2). Waiting...")
-        page.wait_for_timeout(1500)
-        scroll_and_wait(page)
-
-    if not first_href:
-        html_doc = get_html_content(page)
-        match = re.search(r'https://jobright\\.ai/jobs/info/[^"\\\'\\s<]+', html_doc)
-        if not match:
-            match = re.search(r'/jobs/info/[^"\\\'\\s<]+', html_doc)
-        if match:
-            first_href = match.group(0)
-            if first_href.startswith("/"):
-                first_href = "https://jobright.ai" + first_href
-
-    if not first_href:
-        print("   ❌ Could not resolve the first job link.")
-        if args.debug:
-            with open("debug_recommend_page.html", "w", encoding="utf-8") as f:
-                f.write(get_html_content(page))
-            page.screenshot(path="debug_no_job_links.png")
-            print("   Saved debug_recommend_page.html and debug_no_job_links.png")
-        return
-
-    print(f"   ✅ First job link: {first_href}")
-    page.goto(first_href, wait_until="networkidle")
-    page.wait_for_timeout(800)
-    dismiss_detail_modals(page)
-    page.wait_for_selector(
-        "script#jobright-helper-job-detail-info",
-        timeout=8000,
-        state="attached",
-    )
-    print("   ✅ Job detail page loaded.")
-
-
-def login_and_open_first_job(page):
-    do_homepage_login(page)
-
-    if "/jobs/recommend" not in page.url:
-        print("   🔁 Navigating to recommendations page after login...")
-        page.goto("https://jobright.ai/jobs/recommend", wait_until="networkidle")
-        page.wait_for_timeout(800)
-
-    open_first_job_from_recommendations(page)
-
-
-# ─── Detail Extraction ────────────────────────────────────────────────────────
-
-def detect_job_cards(page):
-    candidates = [
-        "div[class*='JobCard']",
-        "div[class*='job-card']",
-        "div[class*='jobCard']",
-        "div[class*='job_card']",
-        "div[class*='JobItem']",
-        "div[class*='job-item']",
-        "li[class*='job']",
-        "article[class*='job']",
-        "[data-testid*='job-card']",
-        "[data-testid*='jobCard']",
-        "div[class*='card']",
-        "div[class*='Card']",
-    ]
-    for sel in candidates:
-        found = page.css(sel)
-        real  = [el for el in found if len(" ".join(el.css("*::text").getall())) > 30]
-        if real:
-            print(f"   ✅ Selector '{sel}' → {len(real)} cards")
-            return real
-    return []
-
-
-def extract(card, *selectors, default="N/A"):
-    for sel in selectors:
-        val = card.css(sel).get()
-        if val and val.strip():
-            return val.strip()
-    return default
+    raise AttributeError(f"Could not extract HTML from {type(target).__name__}")
 
 
 def as_list(value):
@@ -359,12 +140,462 @@ def as_list(value):
     if isinstance(value, list):
         return [item for item in value if item not in (None, "")]
     if isinstance(value, str):
-        parts = [part.strip() for part in value.split(",")]
-        return [part for part in parts if part]
+        return [p.strip() for p in value.split(",") if p.strip()]
     return [value]
 
 
-def extract_job_payload(page):
+# --- Phase 1: Login ------------------------------------------------------------
+
+def do_homepage_login(page):
+    """Full login flow via the auth modal. Returns True on success."""
+    print("   ⏳ Waiting for homepage to fully load...")
+    page.wait_for_load_state("networkidle", timeout=20000)
+    page.wait_for_timeout(800)
+
+    print("   🖱️  Opening auth dialog...")
+    auth_trigger_selectors = [
+        "text=SIGN IN",
+        "text=Sign In",
+        "text=Sign in",
+        "button:has-text(\"JOIN NOW\")",
+        "button:has-text(\"Try For Free\")",
+    ]
+    auth_trigger = None
+    for sel in auth_trigger_selectors:
+        try:
+            auth_trigger = page.query_selector(sel)
+            if auth_trigger:
+                print(f"   ✅ Found auth trigger: {sel}")
+                auth_trigger.click()
+                page.wait_for_timeout(700)
+                break
+        except Exception:
+            continue
+
+    if not auth_trigger:
+        print("   ⚠️  No auth trigger found on homepage.")
+        if args.debug:
+            try:
+                page.screenshot(path="debug_no_auth_trigger.png")
+            except Exception:
+                pass
+        return False
+
+    # Switch to sign-in if dialog opened in signup mode
+    switch_to_signin = (
+        page.query_selector("button:has-text(\"Already a member? Sign in now\")")
+        or page.query_selector("button:has-text(\"Sign in now\")")
+        or page.query_selector("button:has-text(\"Already a member\")")
+        or page.query_selector("button:has-text(\"Not a member? Sign up now\")")
+    )
+    if switch_to_signin and "not a member" not in (switch_to_signin.inner_text() or "").strip().lower():
+        print("   🔁 Switching auth dialog to sign in...")
+        try:
+            switch_to_signin.click()
+            page.wait_for_timeout(700)
+        except Exception:
+            pass
+
+    # Fill credentials
+    print("   🔐 Filling login form...")
+    email_sel = "input[placeholder='Email'], input[placeholder*='email' i], input[type='email'], input[name='email']"
+    password_sel = "input[placeholder='Password'], input[type='password']"
+
+    try:
+        page.wait_for_selector(email_sel, timeout=10000)
+        page.wait_for_selector(password_sel, timeout=10000)
+    except Exception:
+        print("   ⚠️  Sign-in fields did not appear.")
+        if args.debug:
+            try:
+                page.screenshot(path="debug_signin_fields.png")
+            except Exception:
+                pass
+        return False
+
+    email_input = page.query_selector(email_sel)
+    password_input = page.query_selector(password_sel)
+    if not email_input or not password_input:
+        print("   ❌ Could not find both sign-in inputs.")
+        return False
+
+    email_input.click()
+    email_input.fill("")
+    email_input.fill(EMAIL)
+    password_input.click()
+    password_input.fill("")
+    password_input.fill(PASSWORD)
+
+    # Submit
+    submit_btn = (
+        page.query_selector("button[type='submit']:has-text(\"SIGN IN\")")
+        or page.query_selector("button[type='submit']:has-text(\"Sign In\")")
+        or page.query_selector("button:has-text(\"SIGN IN\")")
+        or page.query_selector("button:has-text(\"Sign In\")")
+        or page.query_selector("button:has-text(\"Sign in\")")
+    )
+    print("   🚀 Submitting login form...")
+    if submit_btn:
+        submit_btn.click()
+    else:
+        password_input.press("Enter")
+
+    # Wait for redirect to recommendations
+    print("   ⏳ Waiting for redirect after login...")
+    try:
+        page.wait_for_url("**/jobs/recommend**", timeout=20000)
+        print("   ✅ Redirected to recommendations page!")
+    except Exception:
+        page.wait_for_load_state("networkidle", timeout=15000)
+        page.wait_for_timeout(1200)
+        print(f"   Current URL after login: {page.url}")
+        if "/jobs/recommend" not in page.url:
+            print("   ❌ Did not reach recommendations page.")
+            return False
+
+    if args.debug:
+        try:
+            page.screenshot(path="debug_after_login.png")
+        except Exception:
+            pass
+    return True
+
+
+# --- Phase 2: Collect Job Links ------------------------------------------------
+
+def is_usa_location(location):
+    """
+    Check if a job location string is USA-based.
+    Handles formats like: 'United States', 'San Francisco, CA', 'NYC Metro Area',
+    'Boulder, Colorado', 'American Fork, UT', 'Remote', etc.
+    Returns True if USA, False otherwise.
+    """
+    if not location or not location.strip():
+        return True  # include if no location data
+
+    loc = location.strip()
+    loc_lower = loc.lower()
+
+    # --- Quick USA keyword match ---
+    usa_keywords = [
+        'united states', 'usa', 'u.s.a', 'u.s.', ' us ',
+        'remote', 'nyc', 'metro area', 'bay area', 'silicon valley',
+    ]
+    for kw in usa_keywords:
+        if kw in loc_lower:
+            return True
+
+    # --- US state abbreviations (e.g. ', CA', ', NY', ', TX') ---
+    import re as _re
+    state_abbrs = (
+        'AL,AK,AZ,AR,CA,CO,CT,DE,FL,GA,HI,ID,IL,IN,IA,KS,KY,LA,ME,MD,'
+        'MA,MI,MN,MS,MO,MT,NE,NV,NH,NJ,NM,NY,NC,ND,OH,OK,OR,PA,RI,SC,'
+        'SD,TN,TX,UT,VT,VA,WA,WV,WI,WY,DC'
+    )
+    abbr_pattern = r',\s*(' + '|'.join(state_abbrs.split(',')) + r')\s*$'
+    if _re.search(abbr_pattern, loc, _re.IGNORECASE):
+        return True
+
+    # --- Full US state names ---
+    state_names = [
+        'alabama','alaska','arizona','arkansas','california','colorado',
+        'connecticut','delaware','florida','georgia','hawaii','idaho',
+        'illinois','indiana','iowa','kansas','kentucky','louisiana','maine',
+        'maryland','massachusetts','michigan','minnesota','mississippi',
+        'missouri','montana','nebraska','nevada','new hampshire',
+        'new jersey','new mexico','new york','north carolina','north dakota',
+        'ohio','oklahoma','oregon','pennsylvania','rhode island',
+        'south carolina','south dakota','tennessee','texas','utah',
+        'vermont','virginia','west virginia','wisconsin','wyoming',
+        'washington dc', 'district of columbia',
+    ]
+    for state in state_names:
+        if state in loc_lower:
+            return True
+
+    # --- Major US cities (top 100) ---
+    us_cities = [
+        'new york','los angeles','chicago','houston','phoenix','philadelphia',
+        'san antonio','san diego','dallas','san jose','austin','jacksonville',
+        'fort worth','columbus','charlotte','san francisco','indianapolis',
+        'seattle','denver','boston','el paso','detroit','nashville','portland',
+        'oklahoma city','las vegas','louisville','baltimore','milwaukee',
+        'albuquerque','tucson','fresno','sacramento','mesa','kansas city',
+        'atlanta','long beach','colorado springs','raleigh','miami',
+        'virginia beach','omaha','oakland','minneapolis','tulsa','arlington',
+        'new orleans','wichita','cleveland','bakersfield','tampa','aurora',
+        'honolulu','anaheim','santa ana','corpus christi','riverside',
+        'lexington','stockton','henderson','st. louis','pittsburgh',
+        'cincinnati','irvine','orlando','plano','newark','toledo',
+        'greensboro','durham','lincoln','buffalo','madison','lubbock',
+        'chandler','scottsdale','glendale','reno','norfolk','winston-salem',
+        'north las vegas','irving','chesapeake','gilbert','hialeah',
+        'garland','fremont','boise','richmond','baton rouge','spokane',
+        'des moines','tacoma','san bernardino','modesto','fontana',
+        'santa clarita','birmingham','oxnard','fayetteville','rochester',
+        'moreno valley','springfield','fort collins','jackson','alexandria',
+        'hayward','lancaster','lakewood','clarksville','palmdale','salinas',
+        'pasadena','sunnyvale','macon','pomona','escondido','killeen',
+        'hampton','warren','midland','carrollton','cedar rapids',
+        'sterling heights','new haven','denton','concord','topeka',
+        'elizabeth','thousand oaks','charleston','visalia','beaumont',
+        'miami gardens','coral springs','simi valley','hartford','lafayette',
+        'athens','ventura','abilene','norman','vallejo','evansville',
+        'ann arbor','allentown','provo','peoria','downey','carlsbad',
+        'waco','independence','elgin','albany','odessa','daly city',
+        'new bedford','conroe','redding','green bay','boulder',
+        'american fork','san mateo','menlo park','palo alto',
+        'mountain view','cupertino','santa clara','milpitas','pleasanton',
+        'dublin','livermore','walnut creek','san ramon','danville',
+        'alameda','berkeley','el cerrito','san pablo','pinole','hercules',
+        'martinez','pleasant hill','san leandro','castro valley',
+        'union city','hayward','lafayette','orinda','moraga',
+        'south san francisco','brisbane','millbrae','burlingame',
+        'san bruno','menlo park','redwood city','san jose','campbell',
+        'los gatos','saratoga','mountain view','palo alto',
+    ]
+    for city in us_cities:
+        if city in loc_lower:
+            return True
+
+    # If none of the above matched, assume non-USA
+    return False
+
+
+def collect_job_links(page, limit):
+    """
+    Collect up to `limit` unique job links from /jobs/recommend.
+    Only includes USA-based jobs.
+    Primary: /swan/recommend/list/jobs XHR API.
+    Fallback: DOM scrolling.
+    """
+    print(f"\n📋 Collecting up to {limit} USA job links...")
+    page.wait_for_url("**/jobs/recommend**", timeout=20000)
+    page.wait_for_load_state("domcontentloaded", timeout=20000)
+    page.wait_for_timeout(max(args.wait, 3000))
+
+    # Accumulators for both strategies
+    all_links = []
+    seen_ids = set()
+
+    # -- Strategy 1: XHR API -------------------------------------------
+    print("   Trying /swan/recommend/list/jobs API...")
+    try:
+        api_result = page.evaluate(
+            """async (limit) => {
+                const count = 10;
+                const allJobs = [];
+                let position = 0;
+                let refresh = true;
+
+                while (allJobs.length < limit) {
+                    const params = new URLSearchParams({
+                        refresh: String(refresh),
+                        sortCondition: "0",
+                        position: String(position),
+                        count: String(count),
+                        syncRerank: "false",
+                    });
+
+                    const response = await fetch(
+                        `/swan/recommend/list/jobs?${params.toString()}`,
+                        {
+                            method: "GET",
+                            credentials: "include",
+                            headers: {
+                                "accept": "application/json, text/plain, */*",
+                                "x-requested-with": "XMLHttpRequest",
+                            },
+                        }
+                    );
+
+                    if (!response.ok) {
+                        return { error: `API returned ${response.status}`, jobs: allJobs };
+                    }
+
+                    const data = await response.json();
+                    const batch = data?.result?.jobList || [];
+                    if (!batch.length) break;
+
+                    for (const item of batch) {
+                        const job = item?.jobResult || {};
+                        if (!job.jobId) continue;
+                        allJobs.push({
+                            job_id: String(job.jobId),
+                            title: job.jobTitle || "N/A",
+                            company: item?.companyResult?.companyName || "",
+                            location: job.jobLocation || "",
+                            url: `https://jobright.ai/jobs/info/${job.jobId}`,
+                        });
+                        if (allJobs.length >= limit) break;
+                    }
+
+                    if (batch.length < count) break;
+                    position += count;
+                    refresh = false;
+                }
+
+                return { jobs: allJobs, fetched: allJobs.length };
+            }""",
+            limit,
+        )
+
+        api_jobs = (api_result or {}).get("jobs", [])
+        if api_jobs:
+            # Filter to USA-only jobs
+            for j in api_jobs:
+                loc = j.get("location", "")
+                if is_usa_location(loc):
+                    if j["job_id"] not in seen_ids:
+                        seen_ids.add(j["job_id"])
+                        all_links.append(j)
+                # else: silently drop non-USA
+            dropped = len(api_jobs) - len(all_links)
+            if dropped > 0:
+                print(f"   🚫 Filtered out {dropped} non-USA jobs from API.")
+            if len(all_links) >= limit:
+                print(f"   ✅ API returned {len(all_links)} USA job links.")
+                return all_links[:limit]
+            print(f"   ℹ️  API gave {len(all_links)} USA jobs (need {limit}). Supplementing from DOM...")
+        else:
+            err = (api_result or {}).get("error", "no jobs returned")
+            print(f"   ⚠️  API failed: {err}. Falling back to DOM...")
+    except Exception as e:
+        print(f"   ⚠️  API error: {e}. Falling back to DOM...")
+
+    # -- Strategy 2: DOM scrolling --------------------------------------
+    # Continue from partial API results (all_links / seen_ids already initialized above)
+    _dropped_non_usa = 0
+
+    for scroll_round in range(5):
+        dismiss_modals(page)
+        page.wait_for_timeout(500)
+        scroll_and_wait(page)
+
+        try:
+            dom_links = page.evaluate(
+                """() => {
+                    const items = [];
+                    const seen = new Set();
+                    const links = Array.from(
+                        document.querySelectorAll("a[href*='/jobs/info/']")
+                    );
+                    for (const link of links) {
+                        const href = link.href || "";
+                        if (!href || seen.has(href)) continue;
+                        seen.add(href);
+                        const card = link.closest("article, li, div[class*='card'], div[class*='Card']");
+                        const cardText = card
+                            ? (card.innerText || card.textContent || "").replace(/\\s+/g, " ").trim()
+                            : "";
+                        const text = (link.innerText || link.textContent || "")
+                            .replace(/\\s+/g, " ").trim();
+                        // Try to extract location from the card text
+                        let location = "";
+                        const lines = cardText.split("\\n").map(l => l.trim()).filter(l => l);
+                        // Location is often a line that looks like a city/state
+                        for (const line of lines) {
+                            if (/^[A-Z][a-z]+(, [A-Z]{2})?$/.test(line) ||
+                                /United States|Remote|Hybrid/.test(line)) {
+                                location = line;
+                                break;
+                            }
+                        }
+                        items.push({ url: href, text: text, location: location });
+                    }
+                    return items;
+                }"""
+            )
+        except Exception:
+            dom_links = []
+
+        for item in dom_links:
+            m = re.search(r'/jobs/info/([^/?#]+)', item["url"])
+            job_id = m.group(1) if m else item["url"]
+            if job_id not in seen_ids:
+                # USA filter: skip non-USA jobs
+                item_loc = item.get("location", "")
+                item_text = item.get("text", "")
+                if not is_usa_location(item_loc):
+                    # Try to check text as fallback
+                    if not is_usa_location(item_text):
+                        _dropped_non_usa += 1
+                        continue  # skip non-USA
+                seen_ids.add(job_id)
+                all_links.append({
+                    "job_id": job_id,
+                    "title": item["text"][:120] if len(item["text"]) > 5 else "N/A",
+                    "company": "",
+                    "location": item_loc,
+                    "url": item["url"],
+                })
+
+        print(f"   📌 Scroll round {scroll_round + 1}: {len(all_links)} unique USA links...")
+        if len(all_links) >= limit:
+            break
+
+    if _dropped_non_usa > 0:
+        print(f"   🚫 Filtered out {_dropped_non_usa} non-USA jobs from DOM.")
+    print(f"   ✅ Collected {len(all_links)} USA job links total.")
+    return all_links[:limit]
+
+
+# --- Phase 3: Detail Scraping (same browser session) ---------------------------
+
+def scrape_single_job(page, job_link, index, total):
+    """
+    Navigate to a single job detail page, parse it, and return (detail, error).
+    Uses the SAME browser page — no new session needed.
+    """
+    job_url = job_link.get("url", "")
+    title_hint = job_link.get("title", "")[:60]
+
+    print(f"\n[{index}/{total}] {title_hint}")
+    print(f"   🌐 {job_url}")
+
+    # Navigate to detail page
+    try:
+        page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
+    except Exception as e:
+        print(f"   ⚠️  Navigation timed out: {e}")
+        print(f"   🌐 Current URL: {page.url}")
+
+    page.wait_for_timeout(1500)
+    dismiss_modals(page)
+
+    # Wait for detail payload script tag
+    try:
+        page.wait_for_selector(
+            "script#jobright-helper-job-detail-info",
+            timeout=25000,
+            state="attached",
+        )
+    except Exception as e:
+        print(f"   ⚠️  Detail payload not found: {e}")
+        if args.debug:
+            try:
+                prefix = f"debug_detail_{job_link.get('job_id', 'unknown')}"
+                with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+                    f.write(get_html_content(page))
+                page.screenshot(path=f"{prefix}.png")
+            except Exception:
+                pass
+        return None, str(e)
+
+    # Parse
+    try:
+        detail = build_job_detail(page)
+    except Exception as e:
+        print(f"   ❌ Parse error: {e}")
+        return None, str(e)
+
+    print(f"   ✅ {detail['job']['title']} @ {detail['job']['company']} "
+          f"(match: {detail['match_score']})")
+    return detail, None
+
+
+def build_job_detail(page):
+    """Parse the page into our standard job detail dict."""
     html_doc = get_html_content(page)
     match = re.search(
         r'<script[^>]+id=["\']jobright-helper-job-detail-info["\'][^>]*>\s*(.*?)\s*</script>',
@@ -377,18 +608,13 @@ def extract_job_payload(page):
         payload_text = page.css("script#jobright-helper-job-detail-info::text").get()
 
     if not payload_text:
-        raise ValueError("Could not find embedded job detail JSON.")
+        raise ValueError("Could not find embedded job detail JSON on page.")
 
-    return json.loads(html.unescape(payload_text.strip()))
-
-
-def parse_job_detail(page):
-    print("\n🔍 Parsing first recommended job detail page...")
-    payload = extract_job_payload(page)
+    payload = json.loads(html.unescape(payload_text.strip()))
     job = payload.get("jobResult", {})
     company = payload.get("companyResult", {})
 
-    detail = {
+    return {
         "job_url": str(page.url),
         "match_score": payload.get("displayScore"),
         "match_rank": payload.get("rankDesc"),
@@ -447,89 +673,198 @@ def parse_job_detail(page):
         },
     }
 
-    print("✅ First job scraped:")
-    print(f"   Title    : {detail['job']['title']}")
-    print(f"   Company  : {detail['job']['company']}")
-    print(f"   Location : {detail['job']['location']}")
-    print(f"   Salary   : {detail['job']['salary']}")
-    print(f"   Match    : {detail['match_score']} ({detail['match_rank']})")
-    print(f"   URL      : {detail['job_url']}")
 
-    if args.debug:
-        with open("debug_job_detail.html", "w", encoding="utf-8") as f:
-            f.write(get_html_content(page))
-        print("🐛 Debug file saved: debug_job_detail.html")
+# --- Phase 4: Ingest -----------------------------------------------------------
 
-    return detail
+def submit_to_ingest(job_detail):
+    """POST a single job detail to the Hermes dashboard ingest endpoint."""
+    if not SCRAPER_INGEST_SECRET:
+        print("   ⚠️  SCRAPER_INGEST_SECRET not set — skipping ingest.")
+        return False, "no_secret"
+
+    payload = json.dumps(job_detail).encode()
+    req = urllib.request.Request(
+        INGEST_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {SCRAPER_INGEST_SECRET}",
+        },
+    )
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        resp = urllib.request.urlopen(req, context=ctx, timeout=30)
+        body = resp.read().decode()
+        print(f"   📤 Ingest OK ({resp.status})")
+        return True, None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:300] if e.fp else ""
+        print(f"   ❌ Ingest failed ({e.code}): {body}")
+        return False, f"http_{e.code}"
+    except Exception as e:
+        print(f"   ❌ Ingest error: {e}")
+        return False, str(e)
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# --- Main ----------------------------------------------------------------------
 
 def main():
     if not EMAIL or not PASSWORD:
-        print("❌ Missing credentials! Create a .env file:\n")
-        print("   JOBRIGHT_EMAIL=your@email.com")
-        print("   JOBRIGHT_PASSWORD=yourpassword\n")
+        print("❌ Missing credentials! Check your .env file.\n")
         sys.exit(1)
 
     print("=" * 65)
-    print("  Jobright.ai Scraper  |  Modal Login Flow")
+    print(f"  Jobright.ai Batch Scraper  |  Target: {args.jobs} jobs")
     print("=" * 65)
     print(f"  Account : {EMAIL}")
-    print(f"  Jobs    : {args.jobs}")
-    print(f"  Wait    : {args.wait}ms")
+    print(f"  Output  : {args.output}")
     print(f"  Debug   : {args.debug}")
+    print(f"  Dry-run : {args.dry_run}")
     print("=" * 65 + "\n")
 
     if args.xvfb and not start_xvfb():
         sys.exit(1)
 
+    batch_results = {
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "target_count": args.jobs,
+        "succeeded": 0,
+        "failed": 0,
+        "jobs": [],
+    }
+
     try:
         from scrapling.fetchers import StealthyFetcher
 
-        # ── STEP 1: Login and stay in the same session ────────────
-        print("STEP 1 → Login and open the first recommended job\n")
+        # ================================================================
+        # Single page_action: login → collect links → scrape all → ingest all
+        # ================================================================
 
-        job_page = StealthyFetcher.fetch(
+        class _BatchScraper:
+            """
+            One browser session that:
+            1. Logs in
+            2. Collects N job links
+            3. Loops through each: navigate → parse → ingest
+            """
+            def __init__(self):
+                self.batch_results = batch_results
+                self.job_links = []
+
+            def __call__(self, page):
+                # -- Login --
+                ok = do_homepage_login(page)
+                if not ok:
+                    raise RuntimeError("Login failed")
+
+                # Ensure we're on recommendations
+                if "/jobs/recommend" not in page.url:
+                    page.goto(
+                        "https://jobright.ai/jobs/recommend",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    page.wait_for_timeout(1000)
+
+                # -- Collect links --
+                self.job_links = collect_job_links(page, args.jobs)
+
+                if not self.job_links:
+                    raise RuntimeError("No job links collected")
+
+                if args.dry_run:
+                    return  # skip scraping
+
+                # -- Scrape each job (same browser session) --
+                for i, job_link in enumerate(self.job_links, 1):
+                    detail, error = scrape_single_job(page, job_link, i, len(self.job_links))
+
+                    # USA safety check: drop non-USA jobs even if they slipped through
+                    if detail is not None:
+                        loc = detail.get("job", {}).get("location", "")
+                        if not is_usa_location(loc):
+                            print(f"   🚫 Skipping non-USA job: {loc}")
+                            detail = None
+                            error = f"Non-USA location: {loc}"
+
+                    # Ingest
+                    ingest_ok = False
+                    ingest_err = None
+                    if detail is not None:
+                        ingest_ok, ingest_err = submit_to_ingest(detail)
+
+                    if detail is not None and ingest_ok:
+                        self.batch_results["succeeded"] += 1
+                    else:
+                        self.batch_results["failed"] += 1
+                        if not error:
+                            error = ingest_err
+
+                    self.batch_results["jobs"].append({
+                        "job_id": job_link.get("job_id", ""),
+                        "url": job_link.get("url", ""),
+                        "title": job_link.get("title", ""),
+                        "scraped": detail is not None,
+                        "ingest_ok": ingest_ok,
+                        "error": error,
+                        "detail": detail if detail else None,
+                    })
+
+                    # Save progress after every job
+                    with open(args.output, "w", encoding="utf-8") as f:
+                        json.dump(self.batch_results, f, indent=2, ensure_ascii=False)
+
+        scraper = _BatchScraper()
+
+        StealthyFetcher.fetch(
             "https://jobright.ai",
             headless=False,
             network_idle=True,
             wait=3000,
-            page_action=login_and_open_first_job,
+            page_action=scraper,
         )
 
-        current_url = str(job_page.url)
-        print(f"\n   Final URL after session flow: {current_url}")
+        # ================================================================
+        # Summary
+        # ================================================================
+        _print_summary(scraper.batch_results, scraper.job_links)
 
-        if "/jobs/info/" not in current_url:
-            print("\n❌ Did not reach a job detail page.")
-            print("   Login may have failed or the first job did not open.")
-            if args.debug:
-                with open("debug_login_fail.html", "w") as f:
-                    f.write(get_html_content(job_page))
-                print("   Saved debug_login_fail.html")
-            sys.exit(1)
-
-        print("\n✅ Authenticated session preserved and job detail opened.\n")
-
-        # ── STEP 2: Parse the first job detail page ────────────────
-        print("STEP 2 → Extracting the first job detail page\n")
-        print(f"   HTTP {job_page.status} | {job_page.url}\n")
-
-        job_detail = parse_job_detail(job_page)
-
-        # ── STEP 3: Save results ───────────────────────────────────
-        if job_detail:
-            print("\n✅ Done! Scraped the first recommended job.")
-            with open(args.output, "w", encoding="utf-8") as f:
-                json.dump(job_detail, f, indent=2, ensure_ascii=False)
-            print(f"💾 Saved → {args.output}")
-        else:
-            print("\n❌ No job detail scraped.")
-            print("   Try: python Test.py --debug --wait 15000")
-
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Interrupted by user.")
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(batch_results, f, indent=2, ensure_ascii=False)
+        print(f"💾 Partial results saved → {args.output}")
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(batch_results, f, indent=2, ensure_ascii=False)
+        print(f"💾 Partial results saved → {args.output}")
     finally:
         stop_xvfb()
+
+
+def _print_summary(batch_results, job_links):
+    """Print final batch summary."""
+    print("\n" + "=" * 65)
+    print("  BATCH SUMMARY")
+    print("=" * 65)
+    print(f"  Target           : {batch_results['target_count']}")
+    print(f"  Collected        : {len(job_links)}")
+    print(f"  Scraped+Ingested : {batch_results['succeeded']}")
+    print(f"  Failed           : {batch_results['failed']}")
+    print(f"  Output           : {args.output}")
+    print("=" * 65)
+
+    failed_jobs = [j for j in batch_results["jobs"] if not j["ingest_ok"]]
+    if failed_jobs:
+        print("\n  Failed jobs:")
+        for j in failed_jobs:
+            print(f"    - {j['url']}  error: {j['error']}")
+    else:
+        print("\n  ✅ All jobs succeeded!")
 
 
 if __name__ == "__main__":

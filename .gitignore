@@ -18,6 +18,7 @@ env/
 jobright_first_job.json
 jobright_jobs.json
 jobright_recommend_jobs.json
+jobright_batch.json
 linkedin_profile.json
 *.json.tmp
 
