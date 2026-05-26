@@ -677,10 +677,15 @@ def build_job_detail(page):
 # --- Phase 4: Ingest -----------------------------------------------------------
 
 def submit_to_ingest(job_detail):
-    """POST a single job detail to the Hermes dashboard ingest endpoint."""
+    """
+    POST a single job detail to the Hermes dashboard ingest endpoint.
+    Returns: (status, error)
+      status = "ok" | "duplicate" | "error"
+      error = None or error message string
+    """
     if not SCRAPER_INGEST_SECRET:
         print("   ⚠️  SCRAPER_INGEST_SECRET not set — skipping ingest.")
-        return False, "no_secret"
+        return "error", "no_secret"
 
     payload = json.dumps(job_detail).encode()
     req = urllib.request.Request(
@@ -698,15 +703,40 @@ def submit_to_ingest(job_detail):
     try:
         resp = urllib.request.urlopen(req, context=ctx, timeout=30)
         body = resp.read().decode()
-        print(f"   📤 Ingest OK ({resp.status})")
-        return True, None
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            parsed = {}
+
+        if parsed.get("success") is True:
+            print(f"   📤 Ingest OK ({resp.status})")
+            return "ok", None
+
+        # success:false — check if duplicate or real error
+        message = parsed.get("message", "")
+        if "already exist" in message.lower() or "already" in message.lower():
+            print(f"   ♻️  Already in DB (duplicate) — will find replacement")
+            return "duplicate", None
+
+        # Other error
+        print(f"   ❌ Ingest failed: {message}")
+        return "error", message
+
     except urllib.error.HTTPError as e:
-        body = e.read().decode()[:300] if e.fp else ""
-        print(f"   ❌ Ingest failed ({e.code}): {body}")
-        return False, f"http_{e.code}"
+        body = e.read().decode() if e.fp else ""
+        try:
+            parsed = json.loads(body) if body else {}
+        except Exception:
+            parsed = {}
+        message = parsed.get("message", f"HTTP {e.code}")
+        if "already exist" in message.lower():
+            print(f"   ♻️  Already in DB (duplicate, HTTP {e.code}) — will find replacement")
+            return "duplicate", None
+        print(f"   ❌ Ingest HTTP error ({e.code}): {message}")
+        return "error", message
     except Exception as e:
         print(f"   ❌ Ingest error: {e}")
-        return False, str(e)
+        return "error", str(e)
 
 
 # --- Main ----------------------------------------------------------------------
@@ -769,8 +799,10 @@ def main():
                     )
                     page.wait_for_timeout(1000)
 
-                # -- Collect links --
-                self.job_links = collect_job_links(page, args.jobs)
+                # -- Collect initial batch of USA job links --
+                # Request extra to account for duplicates we'll need to replace
+                fetch_limit = args.jobs * 3  # over-fetch so we have replacements ready
+                self.job_links = collect_job_links(page, fetch_limit)
 
                 if not self.job_links:
                     raise RuntimeError("No job links collected")
@@ -779,36 +811,62 @@ def main():
                     return  # skip scraping
 
                 # -- Scrape each job (same browser session) --
-                for i, job_link in enumerate(self.job_links, 1):
-                    detail, error = scrape_single_job(page, job_link, i, len(self.job_links))
+                attempted_ids = set()       # all job_ids we've tried
+                duplicate_count = 0
+                replace_position = args.jobs  # pointer into self.job_links for replacements
 
-                    # USA safety check: drop non-USA jobs even if they slipped through
+                i = 0  # index into self.job_links
+                processed = 0  # how many we've attempted to scrape+ingest
+
+                while processed < args.jobs and i < len(self.job_links):
+                    job_link = self.job_links[i]
+                    job_id = job_link.get("job_id", "")
+
+                    # Skip if we already tried this job_id
+                    if job_id in attempted_ids:
+                        i += 1
+                        continue
+
+                    attempted_ids.add(job_id)
+                    processed += 1
+
+                    detail, error = scrape_single_job(
+                        page, job_link, processed, args.jobs
+                    )
+
+                    # USA safety check
                     if detail is not None:
                         loc = detail.get("job", {}).get("location", "")
                         if not is_usa_location(loc):
-                            print(f"   🚫 Skipping non-USA job: {loc}")
+                            print(f"   🚫 Non-USA, skipping: {loc}")
                             detail = None
-                            error = f"Non-USA location: {loc}"
+                            error = f"Non-USA: {loc}"
 
                     # Ingest
-                    ingest_ok = False
+                    ingest_status = "error"
                     ingest_err = None
                     if detail is not None:
-                        ingest_ok, ingest_err = submit_to_ingest(detail)
+                        ingest_status, ingest_err = submit_to_ingest(detail)
 
-                    if detail is not None and ingest_ok:
+                    if ingest_status == "ok":
                         self.batch_results["succeeded"] += 1
+                    elif ingest_status == "duplicate":
+                        duplicate_count += 1
+                        # Don't count as succeeded or failed — we'll replace it
+                        # The while loop continues and will pick the next replacement
+                        processed -= 1  # don't count this toward our target
                     else:
                         self.batch_results["failed"] += 1
                         if not error:
                             error = ingest_err
 
                     self.batch_results["jobs"].append({
-                        "job_id": job_link.get("job_id", ""),
+                        "job_id": job_id,
                         "url": job_link.get("url", ""),
                         "title": job_link.get("title", ""),
                         "scraped": detail is not None,
-                        "ingest_ok": ingest_ok,
+                        "ingest_ok": ingest_status == "ok",
+                        "ingest_status": ingest_status,
                         "error": error,
                         "detail": detail if detail else None,
                     })
@@ -816,6 +874,10 @@ def main():
                     # Save progress after every job
                     with open(args.output, "w", encoding="utf-8") as f:
                         json.dump(self.batch_results, f, indent=2, ensure_ascii=False)
+
+                    i += 1
+
+                self.batch_results["duplicates"] = duplicate_count
 
         scraper = _BatchScraper()
 
@@ -848,23 +910,36 @@ def main():
 
 def _print_summary(batch_results, job_links):
     """Print final batch summary."""
+    duplicates = batch_results.get("duplicates", 0)
+    succeeded = batch_results["succeeded"]
+    failed = batch_results["failed"]
+    target = batch_results["target_count"]
+
     print("\n" + "=" * 65)
     print("  BATCH SUMMARY")
     print("=" * 65)
-    print(f"  Target           : {batch_results['target_count']}")
-    print(f"  Collected        : {len(job_links)}")
-    print(f"  Scraped+Ingested : {batch_results['succeeded']}")
-    print(f"  Failed           : {batch_results['failed']}")
-    print(f"  Output           : {args.output}")
+    print(f"  Target              : {target}")
+    print(f"  Links collected     : {len(job_links)}")
+    print(f"  New + Ingested      : {succeeded}")
+    if duplicates > 0:
+        print(f"  Duplicates replaced : {duplicates}")
+    print(f"  Failed              : {failed}")
+    print(f"  Output              : {args.output}")
     print("=" * 65)
 
-    failed_jobs = [j for j in batch_results["jobs"] if not j["ingest_ok"]]
-    if failed_jobs:
-        print("\n  Failed jobs:")
-        for j in failed_jobs:
-            print(f"    - {j['url']}  error: {j['error']}")
+    if succeeded >= target:
+        print(f"\n  ✅ Target met! {succeeded}/{target} new jobs ingested.")
     else:
-        print("\n  ✅ All jobs succeeded!")
+        short = target - succeeded
+        print(f"\n  ⚠️  Short by {short} jobs ({succeeded}/{target}). Run again for more.")
+
+    failed_jobs = [j for j in batch_results["jobs"] if j.get("ingest_status") == "error"]
+    if failed_jobs:
+        print(f"\n  Failed jobs ({len(failed_jobs)}):")
+        for j in failed_jobs[:5]:
+            print(f"    - {j.get('url', '')}  error: {j.get('error', 'unknown')}")
+        if len(failed_jobs) > 5:
+            print(f"    ... and {len(failed_jobs) - 5} more")
 
 
 if __name__ == "__main__":
